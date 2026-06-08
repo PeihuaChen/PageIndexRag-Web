@@ -9,7 +9,7 @@ echo.
 cd /d "%~dp0"
 
 echo [1/2] Starting backend on http://localhost:8001 ...
-start "PageIndex-Backend" cmd /c "cd /d "%~dp0" && python -m uvicorn server.main:app --reload --host 0.0.0.0 --port 8001"
+start "PageIndex-Backend" cmd /c "cd /d "%~dp0" && python -m uvicorn server.main:app --reload --host 0.0.0.0 --port 8001 --log-level debug"
 
 timeout /t 3 /nobreak >nul
 

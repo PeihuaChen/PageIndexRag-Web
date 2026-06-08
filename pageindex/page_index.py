@@ -118,7 +118,10 @@ def toc_detector_single_page(content, model=None):
 
     response = ChatGPT_API(model=model, prompt=prompt)
     # print('response', response)
-    json_content = extract_json(response)    
+    json_content = extract_json(response)
+    if json_content is None or 'toc_detected' not in json_content:
+        # LLM call failed or returned invalid response, default to 'no'
+        return 'no'
     return json_content['toc_detected']
 
 
@@ -137,6 +140,8 @@ def check_if_toc_extraction_is_complete(content, toc, model=None):
     prompt = prompt + '\n Document:\n' + content + '\n Table of contents:\n' + toc
     response = ChatGPT_API(model=model, prompt=prompt)
     json_content = extract_json(response)
+    if json_content is None or 'completed' not in json_content:
+        return 'no'
     return json_content['completed']
 
 
@@ -637,7 +642,7 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
     toc_with_page_number = add_page_offset_to_toc_json(toc_with_page_number, offset)
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
-    toc_with_page_number = process_none_page_numbers(toc_with_page_number, page_list, model=model)
+    toc_with_page_number = process_none_page_numbers(toc_with_page_number, page_list, model=model, logger=logger)
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
     return toc_with_page_number
@@ -645,7 +650,7 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
 
 
 ##check if needed to process none page numbers
-def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
+def process_none_page_numbers(toc_items, page_list, start_index=1, model=None, logger=None):
     for i, item in enumerate(toc_items):
         if "physical_index" not in item:
             # logger.info(f"fix item: {item}")
@@ -676,6 +681,9 @@ def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
             item_copy = copy.deepcopy(item)
             del item_copy['page']
             result = add_page_number_to_toc(page_contents, item_copy, model)
+            if (not result or len(result)==0) and logger:
+                logger.info(f"目录项 '{item.get('text', 'Unknown')}' 没有找到匹配结果")
+                continue
             if isinstance(result[0]['physical_index'], str) and result[0]['physical_index'].startswith('<physical_index'):
                 item['physical_index'] = int(result[0]['physical_index'].split('_')[-1].rstrip('>').strip())
                 del item['page']
