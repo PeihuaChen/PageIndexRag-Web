@@ -1079,6 +1079,16 @@ def page_index_main(doc, opt=None):
     logger.info({'total_page_number': len(page_list)})
     logger.info({'total_token': sum([page[1] for page in page_list])})
 
+    # Optionally extract embedded images and inline Markdown references into
+    # the page text so they flow into the tree nodes and render in the UI.
+    if getattr(opt, 'if_extract_images', 'no') == 'yes':
+        try:
+            doc_key = sanitize_filename(get_pdf_name(doc))
+            images_by_page = extract_pdf_images(doc, doc_key=doc_key, logger=logger)
+            merge_images_into_page_list(page_list, images_by_page)
+        except Exception as e:
+            logger.info(f"Image extraction skipped due to error: {e}")
+
     async def page_index_builder():
         structure = await tree_parser(page_list, opt, doc=doc, logger=logger)
         if opt.if_add_node_id == 'yes':

@@ -27,6 +27,8 @@ if __name__ == "__main__":
                       help='Whether to add doc description to the doc')
     parser.add_argument('--if-add-node-text', type=str, default='no',
                       help='Whether to add text to the node')
+    parser.add_argument('--if-extract-images', type=str, default='no',
+                      help='Whether to extract embedded images and inline Markdown references (PDF only)')
                       
     # Markdown specific arguments
     parser.add_argument('--if-thinning', type=str, default='no',
@@ -60,7 +62,8 @@ if __name__ == "__main__":
             if_add_node_id=args.if_add_node_id,
             if_add_node_summary=args.if_add_node_summary,
             if_add_doc_description=args.if_add_doc_description,
-            if_add_node_text=args.if_add_node_text
+            if_add_node_text=args.if_add_node_text,
+            if_extract_images=args.if_extract_images
         )
 
         # Process the PDF

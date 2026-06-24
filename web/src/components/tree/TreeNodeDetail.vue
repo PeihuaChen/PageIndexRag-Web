@@ -1,5 +1,6 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, computed } from 'vue'
+import MarkdownIt from 'markdown-it'
 import { getNode } from '@/api/documents'
 
 const props = defineProps({
@@ -11,6 +12,21 @@ const emit = defineEmits(['close'])
 
 const nodeDetail = ref(null)
 const loading = ref(false)
+
+const md = new MarkdownIt({ html: false, linkify: true })
+
+// Does the node text contain Markdown image references? If so we render it
+// as Markdown so extracted images display inline; otherwise keep the plain
+// monospace <pre> view.
+const hasImages = computed(() => {
+  const t = nodeDetail.value?.text
+  return !!t && /!\[[^\]]*\]\([^)]+\)/.test(t)
+})
+
+const renderedText = computed(() => {
+  if (!nodeDetail.value?.text) return ''
+  return md.render(nodeDetail.value.text)
+})
 
 watch(() => props.nodeId, async (id) => {
   if (!id) return
@@ -58,7 +74,12 @@ watch(() => props.nodeId, async (id) => {
 
       <div class="node-detail__field" v-if="nodeDetail.text">
         <label>Full Text</label>
-        <pre class="node-detail__text node-detail__text--pre">{{ nodeDetail.text }}</pre>
+        <div
+          v-if="hasImages"
+          class="node-detail__text node-detail__text--md markdown-body"
+          v-html="renderedText"
+        ></div>
+        <pre v-else class="node-detail__text node-detail__text--pre">{{ nodeDetail.text }}</pre>
       </div>
     </div>
   </div>
@@ -155,5 +176,17 @@ watch(() => props.nodeId, async (id) => {
   background: var(--color-bg-tertiary);
   padding: var(--space-sm);
   border-radius: var(--border-radius);
+}
+
+.node-detail__text--md :deep(img) {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--border-radius);
+  margin: var(--space-sm) 0;
+  display: block;
+}
+
+.node-detail__text--md :deep(p) {
+  margin: var(--space-xs) 0;
 }
 </style>

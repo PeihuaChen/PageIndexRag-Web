@@ -137,64 +137,26 @@ def delete_metadata(doc_id: str):
 # ========== PDF Processing (subprocess) ==========
 
 async def process_pdf(file_path: str, opt_dict: dict) -> dict:
-    """Run page_index_main in a separate subprocess via python -c."""
-    import subprocess
-    import tempfile
+    """Run page_index_main without spawning a subprocess.
 
-    # Write opt_dict to a temp file
-    opt_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
-    json.dump(opt_dict, opt_file, ensure_ascii=False)
-    opt_file.close()
+    The previous implementation used asyncio.create_subprocess_exec, but on
+    Windows uvicorn installs a SelectorEventLoop which does not support
+    subprocess creation and raises an empty-message NotImplementedError
+    (surfacing as "failed" with a blank error). Instead we run the
+    synchronous page_index_main in a worker thread. page_index_main calls
+    asyncio.run() internally, which works fine in a fresh thread because it
+    has no running event loop of its own.
+    """
+    from types import SimpleNamespace
+    from pageindex.page_index import page_index_main
 
-    result_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
-    result_file.close()
+    opt = SimpleNamespace(**opt_dict)
 
-    script = f'''
-import sys, json
-sys.path.insert(0, r"{Path(__file__).parent.parent.parent}")
-from types import SimpleNamespace
-from pageindex.page_index import page_index_main
-
-with open(r"{opt_file.name}", "r", encoding="utf-8") as f:
-    opt_dict = json.load(f)
-opt = SimpleNamespace(**opt_dict)
-result = page_index_main(r"{file_path}", opt)
-with open(r"{result_file.name}", "w", encoding="utf-8") as f:
-    json.dump(result, f, ensure_ascii=False, indent=2)
-print("DONE")
-'''
+    def _run():
+        return page_index_main(file_path, opt)
 
     loop = asyncio.get_running_loop()
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, '-c', script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-
-    # Clean up opt file
-    try:
-        os.unlink(opt_file.name)
-    except Exception:
-        pass
-
-    if proc.returncode != 0:
-        error_msg = stderr.decode('utf-8', errors='replace').strip()
-        try:
-            os.unlink(result_file.name)
-        except Exception:
-            pass
-        raise RuntimeError(f"PDF processing failed:\n{error_msg}")
-
-    # Read result
-    with open(result_file.name, "r", encoding="utf-8") as f:
-        result = json.load(f)
-    try:
-        os.unlink(result_file.name)
-    except Exception:
-        pass
-
-    return result
+    return await loop.run_in_executor(None, _run)
 
 
 async def process_markdown(file_path: str, params: dict) -> dict:
@@ -250,6 +212,7 @@ async def orchestrate_processing(document_id: str, file_path: str, file_type: st
                 "if_add_node_summary": cfg.get("if_add_node_summary", "yes"),
                 "if_add_doc_description": cfg.get("if_add_doc_description", "no"),
                 "if_add_node_text": cfg.get("if_add_node_text", "no"),
+                "if_extract_images": cfg.get("if_extract_images", "no"),
             }
 
             result = await process_pdf(file_path, opt_dict)
@@ -333,8 +296,13 @@ async def orchestrate_processing(document_id: str, file_path: str, file_type: st
         tracker.complete(document_id, result)
 
     except Exception as e:
+        # Some exceptions (e.g. NotImplementedError) have an empty str(); fall
+        # back to the type name and a traceback so failures are never blank.
+        import traceback
+        err_text = str(e) or f"{type(e).__name__}"
+        tb = traceback.format_exc()
         meta = load_all_metadata().get(document_id, {})
         meta["status"] = "failed"
-        meta["error"] = str(e)
+        meta["error"] = f"{err_text}\n\n{tb}"
         save_metadata(document_id, meta)
-        tracker.fail(document_id, str(e))
+        tracker.fail(document_id, err_text)

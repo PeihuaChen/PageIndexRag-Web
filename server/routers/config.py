@@ -50,6 +50,7 @@ async def get_config():
             "if_add_node_summary": cfg.get("if_add_node_summary", "yes"),
             "if_add_doc_description": cfg.get("if_add_doc_description", "no"),
             "if_add_node_text": cfg.get("if_add_node_text", "no"),
+            "if_extract_images": cfg.get("if_extract_images", "no"),
         }
     }
 
@@ -73,7 +74,8 @@ async def update_config(request: Request):
 
     processing = body.get("processing", {})
     for key in ["toc_check_page_num", "max_page_num_each_node", "max_token_num_each_node",
-                "if_add_node_id", "if_add_node_summary", "if_add_doc_description", "if_add_node_text"]:
+                "if_add_node_id", "if_add_node_summary", "if_add_doc_description", "if_add_node_text",
+                "if_extract_images"]:
         if key in processing:
             cfg[key] = processing[key]
 

@@ -10,6 +10,11 @@ import re
 from pathlib import Path
 from typing import Optional
 
+# Directory where extracted document images are stored. Served by the web
+# server under the "/media" URL prefix (see server/main.py).
+MEDIA_DIR = Path(__file__).resolve().parent.parent.parent / "media"
+MEDIA_URL_PREFIX = "/media"
+
 
 def txt_to_markdown(file_path: str, output_path: str) -> str:
     """Convert a plain text file to Markdown.
@@ -266,7 +271,7 @@ def csv_to_markdown(file_path: str, output_path: str) -> str:
     return output_path
 
 
-def docx_to_markdown(file_path: str, output_path: str) -> str:
+def docx_to_markdown(file_path: str, output_path: str, doc_key: Optional[str] = None) -> str:
     """Convert a Word (.docx) file to Markdown.
 
     Strategy:
@@ -274,6 +279,8 @@ def docx_to_markdown(file_path: str, output_path: str) -> str:
     - Convert heading styles to Markdown headers
     - Preserve basic formatting (bold, italic)
     - Extract tables as Markdown tables
+    - Extract inline images, save them under MEDIA_DIR/<doc_key>/ and insert
+      Markdown references (![...](/media/<doc_key>/<file>)) at their position
     """
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -281,6 +288,48 @@ def docx_to_markdown(file_path: str, output_path: str) -> str:
     doc = Document(file_path)
     filename = Path(file_path).stem
     md_lines = [f"# {filename}\n"]
+
+    # Set up image output directory. Use the output filename stem as a stable,
+    # unique key when an explicit doc_key isn't provided.
+    if doc_key is None:
+        doc_key = Path(output_path).stem
+    img_out_dir = MEDIA_DIR / doc_key
+    image_counter = {"n": 0}
+
+    def _save_rel_image(rel) -> Optional[str]:
+        """Save an image part and return its Markdown reference, or None."""
+        try:
+            blob = rel.target_part.blob
+        except Exception:
+            return None
+        # Derive an extension from the part's content type or partname.
+        partname = str(getattr(rel.target_part, "partname", ""))
+        ext = os.path.splitext(partname)[1].lstrip(".") or "png"
+        image_counter["n"] += 1
+        img_out_dir.mkdir(parents=True, exist_ok=True)
+        fname = f"img{image_counter['n']}.{ext}"
+        try:
+            with open(img_out_dir / fname, "wb") as f:
+                f.write(blob)
+        except Exception:
+            return None
+        url = f"{MEDIA_URL_PREFIX}/{doc_key}/{fname}"
+        return f"![{filename} image {image_counter['n']}]({url})"
+
+    def _extract_para_images(para) -> list:
+        """Return Markdown refs for any inline images embedded in a paragraph."""
+        refs = []
+        # Namespaces for DrawingML blip embeds.
+        rids = re.findall(r'r:embed="([^"]+)"', para._p.xml)
+        rels = para.part.rels
+        for rid in rids:
+            rel = rels.get(rid)
+            if rel is None or "image" not in rel.reltype:
+                continue
+            ref = _save_rel_image(rel)
+            if ref:
+                refs.append(ref)
+        return refs
 
     for element in doc.element.body:
         tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
@@ -298,8 +347,16 @@ def docx_to_markdown(file_path: str, output_path: str) -> str:
             style_name = para.style.name if para.style else ""
             text = para.text.strip()
 
+            # Inline images attached to this paragraph (may exist even with no text)
+            image_refs = _extract_para_images(para)
+
             if not text:
-                md_lines.append("")
+                if image_refs:
+                    md_lines.append("")
+                    md_lines.extend(image_refs)
+                    md_lines.append("")
+                else:
+                    md_lines.append("")
                 continue
 
             # Check for heading styles
@@ -319,6 +376,12 @@ def docx_to_markdown(file_path: str, output_path: str) -> str:
                 # Regular paragraph — try to extract inline formatting
                 rich_text = _extract_rich_text(para)
                 md_lines.append(rich_text)
+
+            # Append any images after the paragraph text
+            if image_refs:
+                md_lines.append("")
+                md_lines.extend(image_refs)
+                md_lines.append("")
 
         elif tag == "tbl":
             # It's a table

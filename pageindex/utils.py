@@ -20,6 +20,55 @@ from types import SimpleNamespace as config
 CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", None)
 
+
+def _bypass_proxy_for_base_url(base_url):
+    """Ensure the API base URL host bypasses any configured HTTP(S) proxy.
+
+    Corporate proxies often intercept and time out (504) connections to
+    internal/local LLM servers (e.g. a local vLLM instance). When the base
+    URL points at such a host, add it to NO_PROXY so the OpenAI/httpx client
+    connects directly. This is a no-op for public API endpoints already
+    reachable through the proxy.
+    """
+    if not base_url:
+        return
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(base_url).hostname
+    except Exception:
+        return
+    if not host:
+        return
+    existing = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
+    hosts = {h.strip() for h in existing.split(",") if h.strip()}
+    if host not in hosts:
+        hosts.add(host)
+        new_value = ",".join(sorted(hosts))
+        # Set both casings; httpx/requests check both.
+        os.environ["NO_PROXY"] = new_value
+        os.environ["no_proxy"] = new_value
+
+
+_bypass_proxy_for_base_url(API_BASE_URL)
+
+# Directory where images extracted from documents are stored.
+# Files here are served by the web server under the "/media" URL prefix
+# (see server/main.py), so any markdown image reference like
+# ![](/media/<doc>/<file>.png) will resolve in the browser.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MEDIA_DIR = PROJECT_ROOT / "media"
+# Public URL prefix that maps to MEDIA_DIR.
+MEDIA_URL_PREFIX = "/media"
+# Minimum image dimension (px) to keep. Skips tiny decorative glyphs/icons.
+_MIN_IMAGE_SIZE = 32
+# When a page has no embedded raster images but contains at least this many
+# vector drawing elements (lines/curves/shapes), it likely holds a diagram
+# drawn with vector graphics (e.g. wiring/engineering drawings). Such pages
+# are rasterized to a PNG so the figure is still captured.
+_MIN_VECTOR_DRAWINGS_FOR_RASTER = 30
+# Zoom factor for rasterizing vector pages (2.0 => ~144 DPI).
+_RASTER_ZOOM = 2.0
+
 def count_tokens(text, model=None):
     if not text:
         return 0
@@ -33,6 +82,7 @@ def count_tokens(text, model=None):
 def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
     max_retries = 10
     client = openai.OpenAI(api_key=api_key, base_url=API_BASE_URL)
+    last_error = None
     for i in range(max_retries):
         try:
             if chat_history:
@@ -52,13 +102,16 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_
                 return response.choices[0].message.content, "finished"
 
         except Exception as e:
+            last_error = e
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
                 time.sleep(1)  # Wait for 1秒 before retrying
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
-                return "Error"
+                # Raise so the caller surfaces the real cause (e.g. invalid
+                # API key) instead of failing later on tuple unpacking.
+                raise RuntimeError(f"LLM call failed after {max_retries} retries: {last_error}") from last_error
 
 
 
@@ -415,7 +468,12 @@ def add_preface_if_needed(data):
 
 
 def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
-    enc = tiktoken.encoding_for_model(model)
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except KeyError:
+        # Non-OpenAI models (e.g. local vLLM models like qwen) aren't known to
+        # tiktoken. Fall back to a generic encoding just for token counting.
+        enc = tiktoken.get_encoding("cl100k_base")
     if pdf_parser == "PyPDF2":
         pdf_reader = PyPDF2.PdfReader(pdf_path)
         page_list = []
@@ -440,7 +498,129 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
     else:
         raise ValueError(f"Unsupported PDF parser: {pdf_parser}")
 
-        
+
+def extract_pdf_images(pdf_path, doc_key=None, logger=None, rasterize_vector_pages=True):
+    """Extract images from a PDF, one group per page.
+
+    Saves each image to ``MEDIA_DIR/<doc_key>/`` and returns a dict mapping
+    a 1-based page number to a list of Markdown image references that point
+    at the served ``/media`` URL, e.g.::
+
+        {1: ["![Page 1 image 1](/media/<doc_key>/p1_img1.png)"], ...}
+
+    Two kinds of images are captured:
+
+    1. Embedded raster images (JPEG/PNG/...) via ``page.get_images()``.
+    2. Vector diagrams: when a page has no embedded raster images but contains
+       many vector drawing elements (``page.get_drawings()``), the whole page
+       is rasterized to a PNG. This covers engineering/wiring drawings that
+       are drawn with vector graphics rather than stored as bitmaps. Disable
+       with ``rasterize_vector_pages=False``.
+
+    Pages without images are simply absent from the returned dict. The
+    returned references can be appended to the corresponding page text so
+    they flow into the tree nodes and render in the frontend.
+
+    ``doc_key`` defaults to the sanitized PDF name. Tiny images (smaller than
+    ``_MIN_IMAGE_SIZE`` on both sides) are skipped to avoid decorative glyphs.
+    """
+    if doc_key is None:
+        doc_key = sanitize_filename(get_pdf_name(pdf_path))
+
+    out_dir = MEDIA_DIR / doc_key
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(pdf_path, BytesIO):
+        doc = pymupdf.open(stream=pdf_path, filetype="pdf")
+    elif isinstance(pdf_path, str) and os.path.isfile(pdf_path) and pdf_path.lower().endswith(".pdf"):
+        doc = pymupdf.open(pdf_path)
+    else:
+        raise ValueError("extract_pdf_images expects a PDF path or BytesIO object.")
+
+    images_by_page = {}
+    for page_index, page in enumerate(doc):
+        page_number = page_index + 1
+        refs = []
+        seen_xrefs = set()
+        for img_index, img in enumerate(page.get_images(full=True)):
+            xref = img[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            try:
+                base = doc.extract_image(xref)
+            except Exception as e:
+                if logger:
+                    logger.info(f"Failed to extract image xref={xref} on page {page_number}: {e}")
+                continue
+
+            if base.get("width", 0) < _MIN_IMAGE_SIZE and base.get("height", 0) < _MIN_IMAGE_SIZE:
+                continue
+
+            ext = base.get("ext", "png")
+            filename = f"p{page_number}_img{img_index + 1}.{ext}"
+            file_path = out_dir / filename
+            try:
+                with open(file_path, "wb") as f:
+                    f.write(base["image"])
+            except Exception as e:
+                if logger:
+                    logger.info(f"Failed to save image {filename}: {e}")
+                continue
+
+            url = f"{MEDIA_URL_PREFIX}/{doc_key}/{filename}"
+            refs.append(f"![Page {page_number} image {img_index + 1}]({url})")
+
+        # Fallback: rasterize pages that are vector diagrams with no raster images.
+        if not refs and rasterize_vector_pages:
+            try:
+                drawings = page.get_drawings()
+            except Exception:
+                drawings = []
+            if len(drawings) >= _MIN_VECTOR_DRAWINGS_FOR_RASTER:
+                filename = f"p{page_number}_page.png"
+                file_path = out_dir / filename
+                try:
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(_RASTER_ZOOM, _RASTER_ZOOM))
+                    pix.save(str(file_path))
+                    url = f"{MEDIA_URL_PREFIX}/{doc_key}/{filename}"
+                    refs.append(f"![Page {page_number}]({url})")
+                    if logger:
+                        logger.info(f"Rasterized vector page {page_number} ({len(drawings)} drawings) -> {filename}")
+                except Exception as e:
+                    if logger:
+                        logger.info(f"Failed to rasterize page {page_number}: {e}")
+
+        if refs:
+            images_by_page[page_number] = refs
+
+    doc.close()
+    if logger:
+        total = sum(len(v) for v in images_by_page.values())
+        logger.info(f"Extracted {total} image(s) across {len(images_by_page)} page(s) into {out_dir}")
+    return images_by_page
+
+
+def merge_images_into_page_list(page_list, images_by_page):
+    """Append Markdown image references to the text of each page in-place.
+
+    ``page_list`` is the list of ``(text, token_length)`` tuples produced by
+    :func:`get_page_tokens`. For every page that has extracted images, the
+    references are appended to that page's text so they propagate into the
+    tree node text. Token lengths are left unchanged (image refs are short).
+    """
+    if not images_by_page:
+        return page_list
+
+    for page_number, refs in images_by_page.items():
+        idx = page_number - 1
+        if idx < 0 or idx >= len(page_list):
+            continue
+        text, token_length = page_list[idx]
+        image_md = "\n\n" + "\n\n".join(refs) + "\n"
+        page_list[idx] = (text + image_md, token_length)
+    return page_list
+
 
 def get_text_of_pdf_pages(pdf_pages, start_page, end_page):
     text = ""

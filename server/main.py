@@ -27,6 +27,13 @@ app.include_router(documents.router)
 app.include_router(chat.router)
 app.include_router(config_router.router)
 
+# Serve extracted document images (referenced from generated Markdown as
+# ![](/media/<doc>/<file>.png)). Must be mounted before the catch-all static
+# mount below so it takes precedence.
+MEDIA_DIR = PROJECT_ROOT / "media"
+MEDIA_DIR.mkdir(exist_ok=True)
+app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
+
 # Serve built frontend (production)
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
